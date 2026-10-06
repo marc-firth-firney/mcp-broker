@@ -30,7 +30,7 @@ When a user clicks "Connect LinkedIn":
    - Production: `https://your-broker-domain/oauth/linkedin/callback`
 6. Copy the **Client ID** and **Client Secret** from the Auth tab
 
-> **Note:** With just the self-serve products, 5 of 12 tools work: `get_me`, `create_post`, `create_image_post`, `create_document_post` (all as member), and `delete_post` (own posts). The remaining 7 tools (org posts, comments, reactions, analytics) require Community Management API approval, which typically takes 1–5 business days. Until the org scopes are added to `_SCOPES` in `adapter.py`, those 7 tools are hidden from `tools/list` so the LLM never sees them; a direct call to one of them is rejected as an unknown tool, and the per-tool guard raises a clear error pointing here before any HTTP request — so they fail safely either way rather than with an opaque 403.
+> **Note:** With just the self-serve products, 6 of 13 tools work: `get_me`, `create_post`, `create_image_post`, `create_document_post`, `create_multi_image_post` (all as member), and `delete_post` (own posts). The remaining 7 tools (org posts, comments, reactions, analytics) require Community Management API approval, which typically takes 1–5 business days. Until the org scopes are added to `_SCOPES` in `adapter.py`, those 7 tools are hidden from `tools/list` so the LLM never sees them; a direct call to one of them is rejected as an unknown tool, and the per-tool guard raises a clear error pointing here before any HTTP request, so they fail safely either way rather than with an opaque 403.
 
 ## 2. Configure Environment
 
@@ -117,6 +117,7 @@ curl -s -X POST \
 | `create_post` | Create a text post (member or org) | Share on LinkedIn |
 | `create_image_post` | Create a post with an attached image (base64) | Share on LinkedIn |
 | `create_document_post` | Create a post with an attached document (base64) — renders as a carousel | Share on LinkedIn |
+| `create_multi_image_post` | Create one post showing 2-20 images together (base64, in display order) | Share on LinkedIn |
 | `delete_post` | Delete a post by URN | Share on LinkedIn |
 | `get_org_posts` | Get recent posts from an org page | Community Management API |
 | `get_managed_orgs` | List organizations you administer | Community Management API |
@@ -127,6 +128,8 @@ curl -s -X POST \
 | `get_post_analytics` | Get post engagement metrics | Community Management API |
 
 > **Media posts** (`create_image_post`, `create_document_post`) upload through LinkedIn's versioned media flow — `POST /rest/images` (or `/rest/documents`) `?action=initializeUpload`, a `PUT` of the raw bytes to the returned upload URL, then a `/rest/posts` referencing the returned URN. Per LinkedIn's Images and Documents API docs, a **member-owned** upload (the default `urn:li:person` author) is permitted with `w_member_social`, so these tools work on the self-serve tier; an organization-owned author still needs the Community Management tier. The image/document bytes are passed as base64 and size-checked (10 MB images, 100 MB documents) before upload. Note that a `w_member_social`-only token is **write-only** on the versioned gateway — you can publish media but cannot `GET` it back. If your LinkedIn app has not been granted access to the versioned media APIs, `initializeUpload` returns the same `403 "API product not approved"` handled below.
+
+> **Multi-image posts** (`create_multi_image_post`) use LinkedIn's [MultiImage API](https://learn.microsoft.com/en-us/linkedin/marketing/community-management/shares/multiimage-post-api): each image goes through the same `/rest/images` upload, then one `/rest/posts` carries `content.multiImage.images` in the order given. LinkedIn accepts 2-20 PNG/JPG/GIF images per post. Every image is decoded and size-checked before the first upload, uploads run four at a time, and the post is created only after every upload succeeds, so a failed upload never publishes a partial set (an image already uploaded stays unattached and unseen). All images travel in one MCP request, which the proxy caps at 1 MiB, so callers should compress large photos before sending them. Optional `alt_texts` sets alt text per image.
 
 ## LinkedIn OAuth Specifics
 

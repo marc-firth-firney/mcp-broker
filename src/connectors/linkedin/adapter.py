@@ -54,6 +54,12 @@ MAX_DOCUMENT_BYTES = 100 * 1024 * 1024
 # inputs against it. Ceil-divide the byte cap by 3, then multiply by 4.
 _MAX_IMAGE_BASE64_CHARS = -(-MAX_IMAGE_BYTES // 3) * 4
 _MAX_DOCUMENT_BASE64_CHARS = -(-MAX_DOCUMENT_BYTES // 3) * 4
+# LinkedIn MultiImage API: one multi-image post carries 2-20 images.
+MIN_MULTI_IMAGES = 2
+MAX_MULTI_IMAGES = 20
+# Multi-image uploads run a few at a time so a 20-image post finishes well inside
+# Cloudflare's 100 s proxy timeout without bursting LinkedIn's upload endpoint.
+MULTI_IMAGE_UPLOAD_CONCURRENCY = 4
 
 # initializeUpload returns the URL the media bytes are PUT to with the access token
 # attached, so that URL is restricted to LinkedIn's own domains (see _validate_upload_url).
@@ -568,6 +574,58 @@ _CREATE_DOCUMENT_POST_META = NativeToolMeta(
     },
 )
 
+_CREATE_MULTI_IMAGE_POST_META = NativeToolMeta(
+    name="create_multi_image_post",
+    description=(
+        "Create a LinkedIn post that shows 2-20 images together (a multi-image post), as the "
+        "authenticated member or a managed organization. Images are base64-encoded bytes "
+        "(PNG/JPG/GIF) in display order. The whole request must stay under the broker's 1 MiB "
+        "body limit, so compress large photos first. If author_urn is omitted, posts as the "
+        "authenticated member. Text max 3000 chars."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "text": {
+                "type": "string",
+                "description": "Post text content (max 3000 chars)",
+            },
+            "images_base64": {
+                "type": "array",
+                "items": {"type": "string", "maxLength": _MAX_IMAGE_BASE64_CHARS},
+                "minItems": MIN_MULTI_IMAGES,
+                "maxItems": MAX_MULTI_IMAGES,
+                "description": (
+                    "2-20 base64-encoded images (PNG/JPG/GIF, up to 10 MB each), in display order."
+                ),
+            },
+            "alt_texts": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": MAX_MULTI_IMAGES,
+                "description": (
+                    "Alternative text per image, in the same order as images_base64 (optional). "
+                    "An empty string leaves that image without alt text."
+                ),
+            },
+            "author_urn": {
+                "type": "string",
+                "description": (
+                    "URN of the author -- urn:li:person:{id} or urn:li:organization:{id}. "
+                    "Defaults to the authenticated member if omitted."
+                ),
+            },
+            "visibility": {
+                "type": "string",
+                "enum": ["PUBLIC", "CONNECTIONS"],
+                "description": "Post visibility (default: PUBLIC)",
+                "default": "PUBLIC",
+            },
+        },
+        "required": ["text", "images_base64"],
+    },
+)
+
 _DELETE_POST_META = NativeToolMeta(
     name="delete_post",
     description="Delete a LinkedIn post by its URN (urn:li:share:*, urn:li:ugcPost:*, or urn:li:activity:*).",
@@ -846,6 +904,33 @@ class LinkedInConnector(NativeConnector):
         )
         return _mcp_text_content(created)
 
+    @native_tool(_CREATE_MULTI_IMAGE_POST_META)
+    async def create_multi_image_post(  # noqa: PLR0913 -- MCP tool signature
+        self,
+        *,
+        access_token: str,
+        text: str,
+        images_base64: list[str],
+        alt_texts: list[str] | None = None,
+        author_urn: str = "",
+        visibility: str = "PUBLIC",
+    ) -> list[dict[str, Any]]:
+        """Create a post showing 2-20 images together (member or managed org author).
+
+        Every image is checked and decoded before any HTTP call, and the post is created
+        only after every upload succeeds, so a failure never publishes a partial set.
+        """
+        if len(text) > MAX_POST_LENGTH:
+            raise ValueError(f"Post text exceeds {MAX_POST_LENGTH} characters ({len(text)} given)")
+        alts = alt_texts or []
+        images = _decode_multi_images(images_base64, alts)
+        author = await _resolve_author_urn(access_token, author_urn)
+        image_urns = await _upload_images(access_token, author, images)
+        body = _rest_post_body(author, text, visibility)
+        body["content"] = _multi_image_content(image_urns, alts)
+        created = await _linkedin_post(access_token, "/rest/posts", body)
+        return _mcp_text_content(created)
+
     @native_tool(_DELETE_POST_META)
     async def delete_post(self, *, access_token: str, post_urn: str) -> list[dict[str, Any]]:
         """Delete a LinkedIn post by URN."""
@@ -1067,7 +1152,9 @@ class LinkedInConnector(NativeConnector):
             "3. Post URNs take the form urn:li:ugcPost:DIGITS or urn:li:share:DIGITS. "
             "Activity URNs (urn:li:activity:DIGITS) are also accepted.\n"
             "4. Reaction types use API values, not UI labels: LIKE, PRAISE (celebrate), "
-            "APPRECIATION (support), EMPATHY (love), INTEREST (insightful), ENTERTAINMENT (funny)."
+            "APPRECIATION (support), EMPATHY (love), INTEREST (insightful), ENTERTAINMENT (funny).\n"
+            "5. To share several images in ONE post, call create_multi_image_post (2-20 images) "
+            "instead of create_image_post repeatedly, which would publish separate posts."
         )
 
 
@@ -1159,6 +1246,66 @@ async def _create_media_post(  # noqa: PLR0913 -- carries the full post + media 
     return await _linkedin_post(
         access_token, "/rest/posts", _rest_post_body(author_urn, text, visibility, media=media)
     )
+
+
+def _decode_multi_images(images_base64: Any, alt_texts: Any) -> list[bytes]:
+    """Check the image list and decode every image BEFORE any HTTP call.
+
+    The schema's minItems/maxItems are advisory (the broker passes raw arguments
+    through), so the real gate is here, as _decode_media is for a single image.
+    """
+    if not isinstance(images_base64, list):
+        raise ValueError("images_base64 must be a list of base64-encoded images")
+    if not MIN_MULTI_IMAGES <= len(images_base64) <= MAX_MULTI_IMAGES:
+        raise ValueError(
+            f"A multi-image post needs {MIN_MULTI_IMAGES}-{MAX_MULTI_IMAGES} images "
+            f"({len(images_base64)} given)"
+        )
+    if not isinstance(alt_texts, list) or len(alt_texts) > len(images_base64):
+        raise ValueError("alt_texts must be a list with at most one entry per image")
+    if not all(isinstance(item, str) for item in [*images_base64, *alt_texts]):
+        raise ValueError("images_base64 and alt_texts must contain only strings")
+    return [
+        _decode_media(image, MAX_IMAGE_BYTES, f"image {position}")
+        for position, image in enumerate(images_base64, start=1)
+    ]
+
+
+async def _upload_images(access_token: str, owner_urn: str, images: list[bytes]) -> list[str]:
+    """Upload every image a few at a time and return the image URNs in input order.
+
+    gather keeps results in input order. On the first failure the remaining uploads
+    are cancelled and the error propagates, so the caller never creates the post.
+    """
+    limit = asyncio.Semaphore(MULTI_IMAGE_UPLOAD_CONCURRENCY)
+
+    async def upload_one(raw_bytes: bytes) -> str:
+        async with limit:
+            upload_url, image_urn = await _initialize_media_upload(
+                access_token, "images", owner_urn
+            )
+            await _upload_media_binary(access_token, upload_url, raw_bytes)
+            return image_urn
+
+    tasks = [asyncio.ensure_future(upload_one(raw_bytes)) for raw_bytes in images]
+    try:
+        return list(await asyncio.gather(*tasks))
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        raise
+
+
+def _multi_image_content(image_urns: list[str], alt_texts: list[str]) -> dict[str, Any]:
+    """Build content.multiImage in upload order, with altText only where one was given."""
+    images: list[dict[str, str]] = []
+    for position, image_urn in enumerate(image_urns):
+        entry = {"id": image_urn}
+        alt_text = alt_texts[position] if position < len(alt_texts) else ""
+        if alt_text:
+            entry["altText"] = alt_text
+        images.append(entry)
+    return {"multiImage": {"images": images}}
 
 
 async def _create_post_v2(

@@ -13,6 +13,8 @@ project Testing Rules.
 
 from __future__ import annotations
 
+import asyncio
+import itertools
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -117,8 +119,8 @@ class TestRegistration:
         # LinkedIn rejects code_verifier — broker cannot send PKCE.
         assert linkedin_connector.meta.supports_pkce is False
 
-    def test_has_twelve_tools(self, linkedin_connector):
-        assert len(linkedin_connector._tools) == 12  # noqa: PLR2004 -- full tool surface
+    def test_has_thirteen_tools(self, linkedin_connector):
+        assert len(linkedin_connector._tools) == 13  # noqa: PLR2004 -- full tool surface
 
     def test_tool_names(self, linkedin_connector):
         assert set(linkedin_connector._tools.keys()) == {
@@ -126,6 +128,7 @@ class TestRegistration:
             "create_post",
             "create_image_post",
             "create_document_post",
+            "create_multi_image_post",
             "delete_post",
             "get_org_posts",
             "get_managed_orgs",
@@ -186,7 +189,7 @@ class TestMCPDispatch:
         assert response["result"]["serverInfo"]["name"] == "linkedin"
 
     async def test_tools_list_excludes_org_tools_by_default(self, linkedin_connector):
-        # With self-serve scopes, only the 5 member tools are advertised; the 7
+        # With self-serve scopes, only the 6 member tools are advertised; the 7
         # org tools are filtered out of tools/list so the LLM never sees them.
         response = await linkedin_connector.handle_mcp_request(
             method="tools/list", params={}, request_id=2, access_token="fake"
@@ -228,6 +231,7 @@ _MEMBER_TOOL_NAMES = {
     "create_post",
     "create_image_post",
     "create_document_post",
+    "create_multi_image_post",
     "delete_post",
 }
 
@@ -245,7 +249,7 @@ class TestToolAvailability:
         assert listed.isdisjoint(_ORG_TOOL_NAMES)
 
     async def test_tools_list_includes_org_tools_when_scopes_enabled(self, linkedin_connector):
-        # Once the Community Management scopes flip the flag, all 10 tools list.
+        # Once the Community Management scopes flip the flag, all 13 tools list.
         with patch("connectors.linkedin.adapter._ORG_TOOLS_ENABLED", True):
             response = await linkedin_connector.handle_mcp_request(
                 method="tools/list", params={}, request_id=21, access_token="fake"
@@ -520,6 +524,194 @@ class TestMediaPosts:
             await linkedin_connector.create_image_post(
                 access_token="fake", text="x" * 3001, image_base64=_FAKE_MEDIA_B64
             )
+
+
+# =============================================================================
+# MULTI-IMAGE POSTS: upload every image, then one post with content.multiImage
+# =============================================================================
+
+# Distinct small payloads so each upload's bytes are identifiable.
+_ONE_B64, _TWO_B64, _THREE_B64 = "b25l", "dHdv", "dGhyZWU="  # b"one", b"two", b"three"
+_POSTS_URL = "https://api.linkedin.com/rest/posts"
+
+
+def _mock_image_uploads(failing_upload: int | None = None) -> tuple[respx.Route, respx.Route]:
+    """Mock initializeUpload (a fresh upload URL + URN per call) and the upload PUTs.
+
+    Uploads run concurrently, so call order need not match input order: tests map each
+    posted URN back to the bytes PUT to its upload URL instead of assuming an order.
+    The first initializeUpload answers last, so the first image finishes uploading
+    last and a post built in completion order would fail the ordering assertion.
+    """
+    counter = itertools.count(1)
+
+    async def initialize(_request: httpx.Request) -> httpx.Response:
+        n = next(counter)
+        await asyncio.sleep(0.05 if n == 1 else 0)
+        value = {
+            "uploadUrl": f"https://www.linkedin.com/dms-uploads/{n}",
+            "image": f"urn:li:image:{n}",
+        }
+        return httpx.Response(200, json={"value": value})
+
+    def put(request: httpx.Request) -> httpx.Response:
+        n = int(request.url.path.rsplit("/", 1)[-1])
+        return httpx.Response(500 if n == failing_upload else 201)
+
+    init = respx.post("https://api.linkedin.com/rest/images").mock(side_effect=initialize)
+    upload = respx.put(url__regex=r"^https://www\.linkedin\.com/dms-uploads/\d+$").mock(
+        side_effect=put
+    )
+    return init, upload
+
+
+def _bytes_by_urn(upload: respx.Route) -> dict[str, bytes]:
+    """Map each image URN to the bytes that were PUT to its upload URL."""
+    return {
+        f"urn:li:image:{call.request.url.path.rsplit('/', 1)[-1]}": call.request.content
+        for call in upload.calls
+    }
+
+
+class TestMultiImagePost:
+    """create_multi_image_post: validate everything, upload each image, post once."""
+
+    @respx.mock
+    async def test_uploads_every_image_then_posts_them_in_order(self, linkedin_connector):
+        init, upload = _mock_image_uploads()
+        create = respx.post(_POSTS_URL).mock(
+            return_value=httpx.Response(201, headers={"x-restli-id": "urn:li:share:11"})
+        )
+
+        content = await linkedin_connector.create_multi_image_post(
+            access_token="tok",
+            text="three photos",
+            images_base64=[_ONE_B64, _TWO_B64, _THREE_B64],
+            alt_texts=["first", "", "third"],
+            author_urn="urn:li:person:abc",
+        )
+
+        # One initializeUpload per image, each owned by the author, then a bearer PUT.
+        assert init.call_count == 3
+        for call in init.calls:
+            assert call.request.url.params["action"] == "initializeUpload"
+            assert json.loads(call.request.content) == {
+                "initializeUploadRequest": {"owner": "urn:li:person:abc"}
+            }
+        assert {call.request.headers["authorization"] for call in upload.calls} == {"Bearer tok"}
+        # Exactly one post, in input order whatever order the uploads finished in.
+        assert create.call_count == 1
+        post_body = json.loads(create.calls.last.request.content)
+        assert post_body["author"] == "urn:li:person:abc"
+        assert post_body["commentary"] == "three photos"
+        images = post_body["content"]["multiImage"]["images"]
+        by_urn = _bytes_by_urn(upload)
+        assert [by_urn[image["id"]] for image in images] == [b"one", b"two", b"three"]
+        # Alt text rides only on the images that were given one.
+        assert [image.get("altText") for image in images] == ["first", None, "third"]
+        assert json.loads(content[0]["text"]) == {"id": "urn:li:share:11"}
+
+    @respx.mock
+    async def test_org_author_owns_the_uploads_and_the_post(self, linkedin_connector):
+        # An explicit author skips the /v2/userinfo lookup (unmocked here, so a call fails).
+        init, _upload = _mock_image_uploads()
+        create = respx.post(_POSTS_URL).mock(
+            return_value=httpx.Response(201, headers={"x-restli-id": "urn:li:share:12"})
+        )
+
+        await linkedin_connector.create_multi_image_post(
+            access_token="tok",
+            text="team day",
+            images_base64=[_ONE_B64, _TWO_B64],
+            author_urn="urn:li:organization:42",
+        )
+
+        owners = {
+            json.loads(call.request.content)["initializeUploadRequest"]["owner"]
+            for call in init.calls
+        }
+        assert owners == {"urn:li:organization:42"}
+        assert json.loads(create.calls.last.request.content)["author"] == "urn:li:organization:42"
+
+    @respx.mock
+    async def test_failed_upload_creates_no_post(self, linkedin_connector):
+        _mock_image_uploads(failing_upload=2)
+        create = respx.post(_POSTS_URL).mock(return_value=httpx.Response(201))
+
+        with pytest.raises(ValueError, match="LinkedIn API error"):
+            await linkedin_connector.create_multi_image_post(
+                access_token="tok",
+                text="three photos",
+                images_base64=[_ONE_B64, _TWO_B64, _THREE_B64],
+                author_urn="urn:li:person:abc",
+            )
+
+        assert not create.called
+
+    @pytest.mark.parametrize("count", [0, 1, 21])
+    @respx.mock
+    async def test_rejects_wrong_image_count_before_any_http(self, linkedin_connector, count):
+        # No routes are mocked, so any outbound request would fail the test.
+        with pytest.raises(ValueError, match="needs 2-20 images"):
+            await linkedin_connector.create_multi_image_post(
+                access_token="tok", text="t", images_base64=[_ONE_B64] * count
+            )
+
+    @respx.mock
+    async def test_rejects_more_alt_texts_than_images(self, linkedin_connector):
+        with pytest.raises(ValueError, match="at most one entry per image"):
+            await linkedin_connector.create_multi_image_post(
+                access_token="tok",
+                text="t",
+                images_base64=[_ONE_B64, _TWO_B64],
+                alt_texts=["a", "b", "c"],
+            )
+
+    @respx.mock
+    async def test_rejects_undecodable_image_naming_its_position(self, linkedin_connector):
+        with pytest.raises(ValueError, match="image 2 is not valid base64"):
+            await linkedin_connector.create_multi_image_post(
+                access_token="tok", text="t", images_base64=[_ONE_B64, "not-base64!!!"]
+            )
+
+    @respx.mock
+    async def test_rejects_oversize_image_before_any_upload(self, linkedin_connector):
+        # b"one" is 3 bytes, over a 2-byte ceiling.
+        with (
+            patch("connectors.linkedin.adapter.MAX_IMAGE_BYTES", 2),
+            pytest.raises(ValueError, match="image 1 is 3 bytes"),
+        ):
+            await linkedin_connector.create_multi_image_post(
+                access_token="tok", text="t", images_base64=[_ONE_B64, _TWO_B64]
+            )
+
+    @respx.mock
+    async def test_rejects_a_bare_string_instead_of_a_list(self, linkedin_connector):
+        with pytest.raises(ValueError, match="must be a list"):
+            await linkedin_connector.create_multi_image_post(
+                access_token="tok", text="t", images_base64=_ONE_B64
+            )
+
+    async def test_rejects_oversize_text(self, linkedin_connector):
+        with pytest.raises(ValueError, match="exceeds"):
+            await linkedin_connector.create_multi_image_post(
+                access_token="tok", text="x" * 3001, images_base64=[_ONE_B64, _TWO_B64]
+            )
+
+    async def test_dispatch_returns_validation_error_as_tool_error(self, linkedin_connector):
+        # Through the real MCP dispatch: a client-safe isError result, not a crash.
+        response = await linkedin_connector.handle_mcp_request(
+            method="tools/call",
+            params={
+                "name": "create_multi_image_post",
+                "arguments": {"text": "t", "images_base64": [_ONE_B64]},
+            },
+            request_id=30,
+            access_token="fake",
+        )
+
+        assert response["result"]["isError"] is True
+        assert "needs 2-20 images" in response["result"]["content"][0]["text"]
 
 
 class TestDecodeMedia:
